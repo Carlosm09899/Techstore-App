@@ -1,0 +1,1767 @@
+const EMAILJS_CONFIG = {
+    publicKey: 'iBPIQKMXDfhhBIO5o',
+    serviceId: 'service_d2aacv3',
+    templateId: 'template_k80j5ul'
+};
+
+emailjs.init({ publicKey: EMAILJS_CONFIG.publicKey });
+
+const cuentaUsuario = document.getElementById('cuentaUsuario');
+let sesionUsuario = null;
+let equiposUsuario = [];
+let productosCatalogo = [];
+let productoCompatibilidadActual = null;
+let resultadoCompatibilidadActual = null;
+let carrito = [];
+let ultimaCompraComprobante = null;
+let compraConfirmadaCheckout = false;
+let carritoSocket = null;
+
+function mostrarUsuario(user) {
+    sesionUsuario = user;
+    cuentaUsuario.innerHTML = `<i class="bi bi-person-check me-1"></i><span class="account-name">${escaparHTML(user.name)}</span>`;
+    cuentaUsuario.classList.add('account-logged-in');
+    cuentaUsuario.removeAttribute('data-bs-target');
+    cuentaUsuario.setAttribute('data-bs-toggle', 'dropdown');
+    cuentaUsuario.title = `Cuenta de ${user.name}`;
+    cargarCarrito();
+    sincronizarCarritoDesdeServidor();
+    actualizarIndicadorCarrito();
+}
+
+function convertirCarritoRemoto(cart) {
+    return (cart?.items || []).map((item) => ({
+        productoId: String(item.productId),
+        nombre: item.name,
+        precio: Number(item.price),
+        cantidad: Number(item.quantity),
+        equipoId: item.equipmentId || '',
+        equipoNombre: item.equipmentName || 'Sin equipo',
+        detalleCompatibilidad: item.compatibilityMessage || 'Pendiente de validar'
+    }));
+}
+
+async function sincronizarCarritoDesdeServidor() {
+    if (!sesionUsuario) return;
+    try {
+        const carritoInvitado = [...carrito];
+        for (const item of carritoInvitado) {
+            await fetch('/api/cart/items', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    productId: item.productoId,
+                    quantity: item.cantidad,
+                    equipmentId: item.equipoId || undefined,
+                    equipmentName: item.equipoNombre,
+                    compatibilityMessage: item.detalleCompatibilidad
+                })
+            });
+        }
+        const respuesta = await fetch('/api/cart', { credentials: 'include' });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo sincronizar el carrito');
+        carrito = convertirCarritoRemoto(data.cart);
+        guardarCarrito();
+        actualizarIndicadorCarrito();
+        renderizarCarrito();
+        if (window.io) {
+            carritoSocket?.disconnect();
+            carritoSocket = window.io({ auth: { token: undefined }, withCredentials: true });
+            carritoSocket.on('cart:updated', (payload) => {
+                carrito = convertirCarritoRemoto(payload.cart);
+                guardarCarrito();
+                actualizarIndicadorCarrito();
+                renderizarCarrito();
+            });
+        }
+    } catch (error) {
+        console.warn('No se pudo cargar el carrito remoto; se mantiene la copia local.', error);
+    }
+}
+
+async function guardarCarritoRemoto() {
+    if (!sesionUsuario) return;
+    try {
+        const actual = await fetch('/api/cart', { method: 'DELETE', credentials: 'include' });
+        if (!actual.ok) throw new Error('No se pudo vaciar el carrito remoto');
+        for (const item of carrito) {
+            const respuesta = await fetch('/api/cart/items', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    productId: item.productoId,
+                    quantity: item.cantidad,
+                    equipmentId: item.equipoId || undefined,
+                    equipmentName: item.equipoNombre,
+                    compatibilityMessage: item.detalleCompatibilidad
+                })
+            });
+            if (!respuesta.ok) throw new Error('No se pudo guardar un producto del carrito');
+        }
+    } catch (error) {
+        console.warn('No se pudo guardar el carrito remoto.', error);
+    }
+}
+
+function limpiarCodigoPaynet() {
+    document.getElementById('paynetBarcodeContainer').classList.add('d-none');
+    document.getElementById('paynetBarcodeVisual').replaceChildren();
+    document.getElementById('paynetBarcodeValue').textContent = '';
+}
+
+function mostrarCuentaInicial() {
+    sesionUsuario = null;
+    equiposUsuario = [];
+    carrito = [];
+    carritoSocket?.disconnect();
+    carritoSocket = null;
+    cuentaUsuario.innerHTML = '<i class="bi bi-person"></i>';
+    cuentaUsuario.classList.remove('account-logged-in');
+    cuentaUsuario.setAttribute('data-bs-toggle', 'modal');
+    cuentaUsuario.setAttribute('data-bs-target', '#modalAuth');
+    cuentaUsuario.title = 'Mi Cuenta';
+    actualizarIndicadorCarrito();
+    renderizarCarrito();
+}
+
+function escaparHTML(valor) {
+    return String(valor ?? '').replace(/[&<>"']/g, (caracter) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+    }[caracter]));
+}
+
+function solicitarInicioSesion(mensaje) {
+    const msgLogin = document.getElementById('msgLogin');
+    msgLogin.textContent = mensaje;
+    msgLogin.className = 'mt-3 small text-center text-warning fw-medium';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalAuth')).show();
+}
+
+function formatoFecha(fecha) {
+    return new Intl.DateTimeFormat('es-MX', {
+        dateStyle: 'medium',
+        timeStyle: 'short'
+    }).format(new Date(fecha));
+}
+
+function claseEstadoOrden(estado) {
+    const clases = {
+        'Pendiente de pago': 'bg-warning text-dark',
+        Pagada: 'bg-success',
+        'En preparación': 'bg-info text-dark',
+        Enviada: 'bg-primary',
+        Entregada: 'bg-success',
+        Cancelada: 'bg-danger'
+    };
+    return clases[estado] || 'bg-secondary';
+}
+
+function estrellasHTML(promedio, mostrarNumero = true) {
+    const valor = Math.max(0, Math.min(5, Number(promedio) || 0));
+    const estrellas = Array.from({ length: 5 }, (_, indice) => {
+        const icono = valor >= indice + 1 ? 'bi-star-fill' : valor >= indice + 0.5 ? 'bi-star-half' : 'bi-star';
+        return `<i class="bi ${icono}"></i>`;
+    }).join('');
+    return `<span class="product-stars" aria-label="${valor.toFixed(1)} de 5 estrellas">${estrellas}</span>${mostrarNumero ? `<span class="review-average">${valor ? valor.toFixed(1) : 'Nuevo'}</span>` : ''}`;
+}
+
+let productoResenasActual = null;
+let estrellasResenaSeleccionadas = 0;
+
+async function abrirResenas(productoId, nombreProducto, permitirPublicar = false) {
+    productoResenasActual = productoId;
+    estrellasResenaSeleccionadas = 0;
+    document.getElementById('tituloResenas').innerHTML = `<i class="bi bi-star me-2"></i>${escaparHTML(nombreProducto)}`;
+    document.getElementById('resumenResenas').textContent = '';
+    document.getElementById('listaResenas').innerHTML = '<p class="text-muted text-center mb-0">Cargando reseñas...</p>';
+    document.getElementById('formularioResena').classList.toggle('d-none', !permitirPublicar);
+    document.getElementById('comentarioResena').value = '';
+    document.getElementById('msgResena').textContent = '';
+    actualizarEstrellasResena();
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalResenas')).show();
+
+    try {
+        const respuesta = await fetch(`/api/productos/${encodeURIComponent(productoId)}/resenas`);
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudieron cargar las reseñas');
+        const resenas = data.resenas || [];
+        const promedio = resenas.length
+            ? resenas.reduce((suma, resena) => suma + Number(resena.estrellas), 0) / resenas.length
+            : 0;
+        document.getElementById('resumenResenas').innerHTML = `${estrellasHTML(promedio, false)} <span class="ms-2">${resenas.length} ${resenas.length === 1 ? 'reseña' : 'reseñas'}</span>`;
+        document.getElementById('listaResenas').innerHTML = resenas.length
+            ? resenas.map((resena) => `
+                <article class="review-item">
+                    <div class="d-flex justify-content-between gap-3">
+                        <div>
+                            <div class="fw-bold">${escaparHTML(resena.nombreUsuario)}</div>
+                            <div class="review-stars">${estrellasHTML(resena.estrellas, false)}</div>
+                        </div>
+                        <time class="small text-muted">${escaparHTML(formatoFecha(resena.createdAt))}</time>
+                    </div>
+                    <p class="mb-0 mt-2 text-muted">${escaparHTML(resena.comentario)}</p>
+                </article>
+            `).join('')
+            : '<div class="text-center text-muted py-4"><i class="bi bi-chat-square-text fs-2 d-block mb-2"></i>Aún no hay reseñas. Sé el primero en compartir tu experiencia.</div>';
+    } catch (error) {
+        document.getElementById('listaResenas').innerHTML = `<p class="text-danger text-center mb-0">${escaparHTML(error.message)}</p>`;
+    }
+}
+
+function actualizarEstrellasResena() {
+    document.querySelectorAll('.review-star').forEach((boton) => {
+        const activo = Number(boton.dataset.estrellas) <= estrellasResenaSeleccionadas;
+        boton.classList.toggle('active', activo);
+        boton.querySelector('i').className = `bi ${activo ? 'bi-star-fill' : 'bi-star'}`;
+    });
+}
+
+function mostrarCompras(orders) {
+    const lista = document.getElementById('listaCompras');
+    lista.innerHTML = '';
+    if (!orders.length) {
+        lista.innerHTML = `
+            <div class="text-center text-muted py-5">
+                <i class="bi bi-receipt-cutoff fs-1 d-block mb-3"></i>
+                Aún no tienes compras registradas.
+            </div>
+        `;
+        return;
+    }
+
+    orders.forEach((order) => {
+        const numeroOrden = String(order._id).slice(-8).toUpperCase();
+        const items = order.items.map((item) => `
+            <div class="border-top pt-3 mt-3">
+                <div class="d-flex justify-content-between gap-3">
+                    <div>
+                        <div class="fw-bold">${escaparHTML(item.nombre)}</div>
+                        <div class="small text-muted">Cantidad: ${item.cantidad}</div>
+                        <div class="small text-muted">Equipo: ${escaparHTML(item.equipoNombre)}</div>
+                        <div class="small text-muted">Compatibilidad: ${escaparHTML(item.compatibilidad)}</div>
+                    </div>
+                    <div class="text-end">
+                        <div class="fw-bold">$${Number(item.subtotal).toLocaleString()} MXN</div>
+                        <button type="button" class="btn btn-sm btn-outline-primary rounded-pill mt-2 btn-escribir-resena" data-producto-id="${escaparHTML(item.productoId)}" data-producto-nombre="${escaparHTML(item.nombre)}">
+                            <i class="bi bi-star me-1"></i>Calificar producto
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `).join('');
+
+        lista.insertAdjacentHTML('beforeend', `
+            <div class="card border-0 shadow-sm rounded-4 mb-3">
+                <div class="card-body p-4">
+                    <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
+                        <div>
+                            <div class="small text-muted">Orden #${numeroOrden}</div>
+                            <h5 class="fw-bold mb-1">Compra del ${formatoFecha(order.createdAt)}</h5>
+                            <div class="small text-muted">Envío a: ${escaparHTML(order.envio.ciudad)}, ${escaparHTML(order.envio.estado)}</div>
+                        </div>
+                        <span class="badge ${claseEstadoOrden(order.estado)} rounded-pill px-3 py-2">${escaparHTML(order.estado)}</span>
+                    </div>
+                    <div class="mt-3">${items}</div>
+                    <div class="border-top mt-3 pt-3 d-flex justify-content-end">
+                        <span class="fw-bold">Total: $${Number(order.total).toLocaleString()} MXN</span>
+                    </div>
+                </div>
+            </div>
+        `);
+    });
+    lista.querySelectorAll('.btn-escribir-resena').forEach((boton) => {
+        boton.addEventListener('click', () => abrirResenas(boton.dataset.productoId, boton.dataset.productoNombre, true));
+    });
+}
+
+async function cargarCompras() {
+    const lista = document.getElementById('listaCompras');
+    lista.innerHTML = '<p class="text-muted text-center mb-0">Cargando compras...</p>';
+    try {
+        const respuesta = await fetch('/api/orders', { credentials: 'include' });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudieron cargar tus compras');
+        mostrarCompras(data.orders || []);
+    } catch (error) {
+        lista.innerHTML = `<p class="text-danger text-center mb-0">${escaparHTML(error.message)}</p>`;
+    }
+}
+
+let direccionesUsuario = [];
+
+function mostrarDirecciones(direcciones) {
+    const lista = document.getElementById('listaDirecciones');
+    lista.innerHTML = '';
+    if (!direcciones.length) {
+        lista.innerHTML = '<p class="text-muted text-center mb-0">Aún no tienes direcciones guardadas.</p>';
+        return;
+    }
+    direcciones.forEach((direccion) => {
+        lista.insertAdjacentHTML('beforeend', `
+            <div class="col-md-6">
+                <div class="card h-100 border-0 bg-light rounded-4">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between gap-2">
+                            <div>
+                                <span class="badge bg-primary rounded-pill">${escaparHTML(direccion.alias)}</span>
+                                <h6 class="fw-bold mt-2 mb-1">${escaparHTML(direccion.nombre)}</h6>
+                            </div>
+                            <div class="d-flex gap-1">
+                                <button type="button" class="btn btn-sm btn-outline-primary rounded-circle editar-direccion" data-id="${escaparHTML(direccion._id)}" aria-label="Editar dirección"><i class="bi bi-pencil"></i></button>
+                                <button type="button" class="btn btn-sm btn-outline-danger rounded-circle eliminar-direccion" data-id="${escaparHTML(direccion._id)}" aria-label="Eliminar dirección"><i class="bi bi-trash"></i></button>
+                            </div>
+                        </div>
+                        <div class="small text-muted mt-2">${escaparHTML(direccion.direccion)}<br>${escaparHTML(direccion.ciudad)}, ${escaparHTML(direccion.estado)}<br>CP ${escaparHTML(direccion.codigoPostal)} · ${escaparHTML(direccion.telefono)}</div>
+                    </div>
+                </div>
+            </div>
+        `);
+    });
+    lista.querySelectorAll('.editar-direccion').forEach((button) => {
+        button.addEventListener('click', () => editarDireccion(button.dataset.id));
+    });
+    lista.querySelectorAll('.eliminar-direccion').forEach((button) => {
+        button.addEventListener('click', () => eliminarDireccion(button.dataset.id));
+    });
+}
+
+async function cargarDirecciones() {
+    const lista = document.getElementById('listaDirecciones');
+    lista.innerHTML = '<p class="text-muted text-center mb-0">Cargando direcciones...</p>';
+    try {
+        const respuesta = await fetch('/api/auth/direcciones', { credentials: 'include' });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudieron cargar las direcciones');
+        direccionesUsuario = data.direcciones || [];
+        mostrarDirecciones(direccionesUsuario);
+    } catch (error) {
+        lista.innerHTML = `<p class="text-danger text-center mb-0">${escaparHTML(error.message)}</p>`;
+    }
+}
+
+function abrirFormularioDireccion(direccion) {
+    const form = document.getElementById('formDireccion');
+    form.reset();
+    form.removeAttribute('data-id');
+    document.getElementById('tituloDireccion').innerHTML = '<i class="bi bi-plus-circle me-2"></i>Agregar dirección';
+    if (direccion) {
+        const valores = {
+            direccionAlias: direccion.alias,
+            direccionNombre: direccion.nombre,
+            direccionTelefono: direccion.telefono,
+            direccionCalle: direccion.direccion,
+            direccionCiudad: direccion.ciudad,
+            direccionEstado: direccion.estado,
+            direccionCodigoPostal: direccion.codigoPostal
+        };
+        Object.entries(valores).forEach(([id, value]) => { document.getElementById(id).value = value; });
+        form.dataset.id = direccion._id;
+        document.getElementById('tituloDireccion').innerHTML = '<i class="bi bi-pencil me-2"></i>Editar dirección';
+    }
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalNuevaDireccion')).show();
+}
+
+function editarDireccion(id) {
+    const direccion = direccionesUsuario.find((item) => String(item._id) === String(id));
+    if (direccion) {
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('modalDirecciones')).hide();
+        abrirFormularioDireccion(direccion);
+    }
+}
+
+async function eliminarDireccion(id) {
+    if (!window.confirm('¿Quieres eliminar esta dirección?')) return;
+    try {
+        const respuesta = await fetch(`/api/auth/direcciones/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include' });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo eliminar la dirección');
+        cargarDirecciones();
+    } catch (error) {
+        document.getElementById('listaDirecciones').insertAdjacentHTML('beforeend', `<p class="text-danger small text-center">${escaparHTML(error.message)}</p>`);
+    }
+}
+
+document.getElementById('misDirecciones').addEventListener('click', () => {
+    if (!sesionUsuario) {
+        solicitarInicioSesion('Primero inicia sesión para administrar tus direcciones.');
+        return;
+    }
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalDirecciones')).show();
+    cargarDirecciones();
+});
+document.getElementById('nuevaDireccion').addEventListener('click', () => abrirFormularioDireccion());
+
+document.getElementById('formDireccion').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const value = (id) => document.getElementById(id).value.trim();
+    const datos = {
+        alias: value('direccionAlias'),
+        nombre: value('direccionNombre'),
+        telefono: value('direccionTelefono'),
+        direccion: value('direccionCalle'),
+        ciudad: value('direccionCiudad'),
+        estado: value('direccionEstado'),
+        codigoPostal: value('direccionCodigoPostal')
+    };
+    const id = form.dataset.id;
+    const mensaje = document.getElementById('msgDireccion');
+    try {
+        const respuesta = await fetch(id ? `/api/auth/direcciones/${encodeURIComponent(id)}` : '/api/auth/direcciones', {
+            method: id ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(datos)
+        });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo guardar la dirección');
+        mensaje.textContent = data.message;
+        mensaje.className = 'small text-center text-success fw-medium mt-3';
+        form.reset();
+        form.removeAttribute('data-id');
+        cargarDirecciones();
+        setTimeout(() => {
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('modalNuevaDireccion')).hide();
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('modalDirecciones')).show();
+        }, 500);
+    } catch (error) {
+        mensaje.textContent = error.message;
+        mensaje.className = 'small text-center text-danger fw-medium mt-3';
+    }
+});
+
+function obtenerClaveCarrito() {
+    return sesionUsuario?.email ? `carrito:${sesionUsuario.email}` : null;
+}
+
+function guardarCarrito() {
+    const clave = obtenerClaveCarrito();
+    if (!clave) return;
+    localStorage.setItem(clave, JSON.stringify(carrito));
+}
+
+function cargarCarrito() {
+    const clave = obtenerClaveCarrito();
+    if (!clave) {
+        carrito = [];
+        return;
+    }
+    try {
+        const data = localStorage.getItem(clave);
+        carrito = data ? JSON.parse(data) : [];
+    } catch (error) {
+        carrito = [];
+    }
+}
+
+function actualizarIndicadorCarrito() {
+    const contador = document.getElementById('carritoCantidad');
+    const total = carrito.reduce((suma, item) => suma + item.cantidad, 0);
+    contador.textContent = total;
+    contador.classList.toggle('d-none', total === 0);
+}
+
+function renderizarCarrito() {
+    const lista = document.getElementById('listaCarrito');
+    const vacio = document.getElementById('carritoVacio');
+    const totalElemento = document.getElementById('carritoTotal');
+    const btnVaciar = document.getElementById('btnVaciarCarrito');
+    const btnCheckout = document.getElementById('btnCheckout');
+    const mensajeCheckout = document.getElementById('mensajeCheckout');
+
+    lista.innerHTML = '';
+    vacio.classList.toggle('d-none', carrito.length > 0);
+    btnVaciar.disabled = carrito.length === 0;
+    btnCheckout.disabled = true;
+    mensajeCheckout.textContent = carrito.length ? 'Validando compatibilidad...' : '';
+    mensajeCheckout.className = 'small text-muted';
+
+    if (carrito.length === 0) {
+        totalElemento.textContent = 'Total: $0 MXN';
+        return;
+    }
+
+    let total = 0;
+    carrito.forEach((item, index) => {
+        const subtotal = item.precio * item.cantidad;
+        total += subtotal;
+        lista.insertAdjacentHTML('beforeend', `
+            <div class="border rounded-4 p-3 mb-3">
+                <div class="d-flex justify-content-between align-items-start gap-3">
+                    <div>
+                        <h6 class="fw-bold mb-1">${escaparHTML(item.nombre)}</h6>
+                        <p class="small text-muted mb-1">Equipo: ${escaparHTML(item.equipoNombre)}</p>
+                        <p class="small text-muted mb-1">Compatibilidad: ${escaparHTML(item.detalleCompatibilidad)}</p>
+                        <p class="small mb-0"><strong>Cantidad:</strong> ${item.cantidad}</p>
+                    </div>
+                    <div class="text-end">
+                        <p class="fw-bold mb-2">$${subtotal.toLocaleString()} MXN</p>
+                        <div class="d-flex align-items-center justify-content-end gap-2">
+                            <div class="btn-group btn-group-sm" role="group" aria-label="Cambiar cantidad">
+                                <button type="button" class="btn btn-outline-secondary disminuir-item-carrito" data-index="${index}" aria-label="Disminuir cantidad">−</button>
+                                <span class="btn btn-outline-secondary disabled cantidad-item-carrito">${item.cantidad}</span>
+                                <button type="button" class="btn btn-outline-secondary aumentar-item-carrito" data-index="${index}" aria-label="Aumentar cantidad">+</button>
+                            </div>
+                            <button type="button" class="btn btn-sm btn-outline-danger rounded-pill eliminar-item-carrito" data-index="${index}">
+                                Eliminar
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `);
+    });
+
+    totalElemento.textContent = `Total: $${total.toLocaleString()} MXN`;
+    lista.querySelectorAll('.disminuir-item-carrito').forEach((boton) => {
+        boton.addEventListener('click', () => {
+            const index = Number(boton.dataset.index);
+            if (carrito[index].cantidad > 1) carrito[index].cantidad -= 1;
+            else carrito.splice(index, 1);
+            guardarCarrito();
+            guardarCarritoRemoto();
+            actualizarIndicadorCarrito();
+            renderizarCarrito();
+        });
+    });
+    lista.querySelectorAll('.aumentar-item-carrito').forEach((boton) => {
+        boton.addEventListener('click', () => {
+            const index = Number(boton.dataset.index);
+            const item = carrito[index];
+            const producto = productosCatalogo.find((elemento) => String(elemento._id) === item.productoId);
+            const stock = Number(producto?.stock);
+            const cantidadTotal = carrito
+                .filter((elemento) => elemento.productoId === item.productoId)
+                .reduce((total, elemento) => total + elemento.cantidad, 0);
+            if (!Number.isInteger(stock) || cantidadTotal >= stock) {
+                document.getElementById('mensajeCheckout').textContent = 'No hay más unidades disponibles de este producto.';
+                document.getElementById('mensajeCheckout').className = 'small text-danger';
+                return;
+            }
+            item.cantidad += 1;
+            guardarCarrito();
+            guardarCarritoRemoto();
+            actualizarIndicadorCarrito();
+            renderizarCarrito();
+        });
+    });
+    lista.querySelectorAll('.eliminar-item-carrito').forEach((boton) => {
+        boton.addEventListener('click', () => {
+            carrito.splice(Number(boton.dataset.index), 1);
+            guardarCarrito();
+            guardarCarritoRemoto();
+            actualizarIndicadorCarrito();
+            renderizarCarrito();
+        });
+    });
+    validarCarritoFinal();
+}
+
+function prepararCheckout() {
+    compraConfirmadaCheckout = false;
+    const resumen = document.getElementById('resumenCheckout');
+    const total = carrito.reduce((suma, item) => suma + (item.precio * item.cantidad), 0);
+    resumen.innerHTML = carrito.map((item) => `
+        <div class="d-flex justify-content-between small mb-2">
+            <span>${escaparHTML(item.nombre)} x${item.cantidad}<br><span class="text-muted">Equipo: ${escaparHTML(item.equipoNombre)}</span></span>
+            <strong>$${(item.precio * item.cantidad).toLocaleString()} MXN</strong>
+        </div>
+    `).join('');
+    document.getElementById('checkoutTotal').textContent = `Total: $${total.toLocaleString()} MXN`;
+    seleccionarMetodoPago('Paynet', 'btnPagarPaynet');
+    document.getElementById('msgCheckout').textContent = '';
+    document.getElementById('msgCheckout').className = 'small fw-medium mt-3';
+    limpiarCodigoPaynet();
+    const selector = document.getElementById('direccionGuardada');
+    selector.innerHTML = '<option value="">Capturar una nueva dirección</option>';
+    direccionesUsuario.forEach((direccion) => {
+        selector.insertAdjacentHTML('beforeend', `<option value="${escaparHTML(direccion._id)}">${escaparHTML(direccion.alias)} - ${escaparHTML(direccion.ciudad)}, ${escaparHTML(direccion.estado)}</option>`);
+    });
+}
+
+function llenarDatosDireccion(direccion) {
+    if (!direccion) return;
+    const datos = {
+        envioNombre: direccion.nombre,
+        envioTelefono: direccion.telefono,
+        envioDireccion: direccion.direccion,
+        envioCiudad: direccion.ciudad,
+        envioEstado: direccion.estado,
+        envioCodigoPostal: direccion.codigoPostal
+    };
+    Object.entries(datos).forEach(([id, value]) => { document.getElementById(id).value = value; });
+}
+
+async function validarCarritoFinal() {
+    const btnCheckout = document.getElementById('btnCheckout');
+    const mensajeCheckout = document.getElementById('mensajeCheckout');
+    if (!sesionUsuario || !carrito.length) {
+        btnCheckout.disabled = true;
+        return false;
+    }
+
+    try {
+        const [respuestaEquipos, respuestaProductos] = await Promise.all([
+            fetch('/api/auth/equipos', { credentials: 'include' }),
+            fetch('/api/productos')
+        ]);
+        const equiposData = await respuestaEquipos.json();
+        const productos = await respuestaProductos.json();
+        if (!respuestaEquipos.ok || !respuestaProductos.ok) {
+            throw new Error('No se pudo confirmar la compatibilidad del carrito');
+        }
+
+        equiposUsuario = equiposData.equipos || [];
+        const problemas = [];
+        carrito.forEach((item) => {
+            const producto = productos.find((elemento) => String(elemento._id) === String(item.productoId));
+            const equipo = equiposUsuario.find((elemento) => String(elemento._id) === String(item.equipoId));
+            if (!producto || !equipo) {
+                problemas.push(`${item.nombre}: producto o equipo ya no disponible`);
+                return;
+            }
+            if (Number(item.precio) !== Number(producto.precio)) {
+                problemas.push(`${item.nombre}: el precio cambió, actualiza el carrito`);
+                return;
+            }
+            if (!Number.isFinite(producto.stock) || producto.stock < item.cantidad) {
+                problemas.push(`${item.nombre}: stock insuficiente`);
+                return;
+            }
+
+            const resultado = validarCompatibilidad(producto, equipo);
+            if (resultado.estado !== 'compatible') {
+                problemas.push(`${item.nombre}: ${resultado.mensaje}`);
+            }
+        });
+
+        if (problemas.length) {
+            btnCheckout.disabled = true;
+            mensajeCheckout.textContent = `Compra bloqueada: ${problemas.join(' ')}`;
+            mensajeCheckout.className = 'small text-danger';
+            return false;
+        }
+
+        btnCheckout.disabled = false;
+        mensajeCheckout.textContent = 'Todos los productos son compatibles con sus equipos.';
+        mensajeCheckout.className = 'small text-success';
+        return true;
+    } catch (error) {
+        btnCheckout.disabled = true;
+        mensajeCheckout.textContent = error.message;
+        mensajeCheckout.className = 'small text-danger';
+        return false;
+    }
+}
+
+function normalizarTexto(texto) {
+    return String(texto || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+
+function parsearLista(valor) {
+    if (Array.isArray(valor)) {
+        return valor.flatMap((item) => String(item || '').split(/[,\/]/)).map((item) => item.trim()).filter(Boolean);
+    }
+    if (typeof valor === 'string') {
+        return valor.split(/[,\/]/).map((item) => item.trim()).filter(Boolean);
+    }
+    return [];
+}
+
+function obtenerTiposAlmacenamiento(tipo) {
+    const valor = normalizarTexto(tipo);
+    const tipos = new Set();
+
+    if (valor.includes('nvme') || valor.includes('pcie')) {
+        tipos.add('NVME_M2');
+    }
+    if (valor.includes('sata') && (valor.includes('m.2') || valor.includes('m2'))) {
+        tipos.add('SATA_M2');
+    }
+    if (valor.includes('sata') || valor.includes('2.5') || valor.includes('3.5') || valor.includes('hdd') || valor.includes('disco') || valor.includes('mecanico')) {
+        tipos.add('SATA_25');
+    }
+    if (valor.includes('m.2') || valor.includes('m2')) {
+        tipos.add('NVME_M2');
+        tipos.add('SATA_M2');
+    }
+    if (valor.includes('ssd') && tipos.size === 0) {
+        tipos.add('SATA_25');
+        tipos.add('NVME_M2');
+    }
+
+    return Array.from(tipos);
+}
+
+function normalizarTiposReglaAlmacenamiento(tipos) {
+    return parsearLista(tipos).flatMap((tipo) => obtenerTiposAlmacenamiento(tipo));
+}
+
+function resolverReglasProducto(producto) {
+    const reglas = producto.compatibilidad || {};
+    let tipoComponente = String(reglas.tipoComponente || '').toUpperCase().trim();
+    const tipoProd = String(producto.tipo_producto || '').toUpperCase().trim();
+    const catProd = String(producto.categoria || '').toUpperCase();
+    const nombreProd = String(producto.nombre || '').toUpperCase();
+
+    if (!tipoComponente || tipoComponente === 'OTRO') {
+        if (tipoProd === 'RAM' || nombreProd.includes('RAM') || catProd.includes('RAM') || nombreProd.match(/\bDDR[345]\b/)) {
+            tipoComponente = 'RAM';
+        } else if (tipoProd === 'SSD' || tipoProd === 'HDD' || catProd.includes('ALMACENAMIENTO') || nombreProd.includes('SSD') || nombreProd.includes('DISCO DURO') || nombreProd.includes('NVME')) {
+            tipoComponente = 'ALMACENAMIENTO';
+        } else if (tipoProd === 'BATERIA' || catProd.includes('LAPTOP') || nombreProd.includes('BATERIA') || nombreProd.includes('PANTALLA')) {
+            tipoComponente = 'REPUESTO_LAPTOP';
+        } else {
+            tipoComponente = 'OTRO';
+        }
+    }
+
+    let ramTipos = parsearLista(reglas.ramTipos);
+    if (tipoComponente === 'RAM' && ramTipos.length === 0) {
+        const textoBuscar = `${nombreProd} ${String(producto.descripcion_corta || '').toUpperCase()}`;
+        const encontrados = textoBuscar.match(/\b(LPDDR5|LPDDR4|DDR5|DDR4|DDR3)\b/g);
+        if (encontrados) ramTipos = Array.from(new Set(encontrados));
+    }
+
+    let almacenamientoTipos = parsearLista(reglas.almacenamientoTipos);
+    if (tipoComponente === 'ALMACENAMIENTO' && almacenamientoTipos.length === 0) {
+        const textoBuscar = normalizarTexto(`${nombreProd} ${producto.descripcion_corta || ''}`);
+        if (textoBuscar.includes('nvme') || textoBuscar.includes('pcie')) almacenamientoTipos.push('NVMe M.2');
+        else if (textoBuscar.includes('m.2') && textoBuscar.includes('sata')) almacenamientoTipos.push('SATA M.2');
+        else if (textoBuscar.includes('sata') || textoBuscar.includes('disco') || textoBuscar.includes('hdd') || textoBuscar.includes('ssd')) almacenamientoTipos.push('SATA 2.5"');
+    }
+
+    return {
+        tipoComponente,
+        ramTipos,
+        almacenamientoTipos,
+        capacidadMinimaGB: reglas.capacidadMinimaGB || null,
+        capacidadMaximaGB: reglas.capacidadMaximaGB || null
+    };
+}
+
+function validarCompatibilidad(producto, equipo) {
+    if (!equipo) {
+        return { estado: 'no-compatible', mensaje: 'Selecciona un equipo para validar compatibilidad.' };
+    }
+
+    const reglas = resolverReglasProducto(producto);
+
+    if (reglas.tipoComponente === 'RAM') {
+        const ramEquipo = String(equipo.ramTipo || '').trim().toUpperCase();
+        if (!ramEquipo) {
+            return { estado: 'incompleta', mensaje: 'Tu equipo no tiene configurado el tipo de memoria RAM.' };
+        }
+
+        const ramTipos = reglas.ramTipos.map((r) => String(r || '').trim().toUpperCase());
+        if (!ramTipos.length) {
+            return { estado: 'compatible', mensaje: `Compatible: memoria utilizable con tu equipo (${ramEquipo}).` };
+        }
+
+        const esCompatible = ramTipos.some((ram) => {
+            if (ram === ramEquipo) return true;
+            if (ramEquipo.includes('DDR4') && ram.includes('DDR4')) return true;
+            if (ramEquipo.includes('DDR5') && ram.includes('DDR5')) return true;
+            if (ramEquipo.includes('DDR3') && ram.includes('DDR3')) return true;
+            return false;
+        });
+
+        return esCompatible
+            ? { estado: 'compatible', mensaje: `Compatible: tu equipo usa ${ramEquipo} y el componente acepta ${ramTipos.join(', ')}.` }
+            : { estado: 'no-compatible', mensaje: `No compatible: tu equipo usa ${ramEquipo} y el componente requiere ${ramTipos.join(', ')}.` };
+    }
+
+    if (reglas.tipoComponente === 'ALMACENAMIENTO') {
+        const almacenamientoEquipo = String(equipo.almacenamientoTipo || '').trim();
+        if (!almacenamientoEquipo) {
+            return { estado: 'incompleta', mensaje: 'Tu equipo no tiene configurado el tipo de almacenamiento soportado.' };
+        }
+
+        const tiposEquipo = obtenerTiposAlmacenamiento(almacenamientoEquipo);
+        // Toda computadora de escritorio (PC) cuenta con puertos SATA para discos 2.5"/3.5"
+        if (equipo.tipo === 'PC' && !tiposEquipo.includes('SATA_25')) {
+            tiposEquipo.push('SATA_25');
+        }
+
+        const tiposProducto = normalizarTiposReglaAlmacenamiento(reglas.almacenamientoTipos);
+        if (!tiposProducto.length) {
+            return { estado: 'compatible', mensaje: `Compatible: tu equipo soporta ${almacenamientoEquipo}.` };
+        }
+
+        const compatible = tiposProducto.some((tipo) => tiposEquipo.includes(tipo));
+        return compatible
+            ? { estado: 'compatible', mensaje: `Compatible: tu equipo soporta ${almacenamientoEquipo} y coincide con los requerimientos del producto.` }
+            : { estado: 'no-compatible', mensaje: `No compatible: tu equipo soporta ${almacenamientoEquipo}, pero el producto requiere ${reglas.almacenamientoTipos.join(', ')}.` };
+    }
+
+    if (reglas.tipoComponente === 'REPUESTO_LAPTOP') {
+        if (equipo.tipo !== 'Laptop') {
+            return { estado: 'no-compatible', mensaje: 'Esta refacción está diseñada para laptops, no para PC de escritorio.' };
+        }
+        return { estado: 'compatible', mensaje: 'Compatible con laptops de especificación estándar.' };
+    }
+
+    return {
+        estado: 'compatible',
+        mensaje: 'Producto compatible con cualquier equipo registrado.'
+    };
+}
+
+function badgeCompatibilidad(reglas, productoOpcional) {
+    const info = productoOpcional ? resolverReglasProducto(productoOpcional) : reglas;
+    if (info.tipoComponente === 'RAM') return `<span class="badge bg-info-subtle text-info-emphasis">RAM ${escaparHTML((info.ramTipos || []).join(', ') || 'DDR compatible')}</span>`;
+    if (info.tipoComponente === 'ALMACENAMIENTO') return `<span class="badge bg-warning-subtle text-warning-emphasis">Almacenamiento ${escaparHTML((info.almacenamientoTipos || []).join(', ') || 'SATA / M.2')}</span>`;
+    if (info.tipoComponente === 'REPUESTO_LAPTOP') return '<span class="badge bg-primary-subtle text-primary">Repuesto Laptop</span>';
+    return '<span class="badge bg-success-subtle text-success-emphasis">Compatible con cualquier equipo</span>';
+}
+
+function mostrarEquipos(equipos) {
+    const lista = document.getElementById('listaEquipos');
+    const sinEquipos = document.getElementById('sinEquipos');
+
+    lista.innerHTML = '';
+    sinEquipos.classList.toggle('d-none', equipos.length > 0);
+    if (equipos.length === 0) return;
+
+    equipos.forEach((equipo) => {
+        const detallesPc = equipo.tipo === 'PC' && equipo.procesador
+            ? `<div><strong>Procesador:</strong> ${escaparHTML(equipo.procesador)}</div>`
+            : '';
+        lista.insertAdjacentHTML('beforeend', `
+            <div class="col-md-6">
+                <div class="card h-100 border-0 bg-light rounded-4">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-start gap-2">
+                            <div>
+                                <span class="badge ${equipo.tipo === 'PC' ? 'bg-dark' : 'bg-primary'} rounded-pill">${escaparHTML(equipo.tipo)}</span>
+                                <h5 class="fw-bold mt-2 mb-1">${escaparHTML(equipo.nombre)}</h5>
+                                <p class="text-muted small mb-3">${escaparHTML(equipo.marca)} ${escaparHTML(equipo.modelo)}</p>
+                            </div>
+                            <div class="d-flex gap-1">
+                                <button type="button" class="btn btn-sm btn-outline-primary rounded-circle editar-equipo" data-equipo-id="${escaparHTML(equipo._id)}" title="Editar equipo" aria-label="Editar ${escaparHTML(equipo.nombre)}">
+                                    <i class="bi bi-pencil"></i>
+                                </button>
+                                <button type="button" class="btn btn-sm btn-outline-danger rounded-circle eliminar-equipo" data-equipo-id="${escaparHTML(equipo._id)}" title="Eliminar equipo" aria-label="Eliminar ${escaparHTML(equipo.nombre)}">
+                                    <i class="bi bi-trash"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="small text-muted">
+                            <div><strong>RAM:</strong> ${escaparHTML(equipo.ramTipo)}${equipo.ramCapacidad ? `, ${escaparHTML(equipo.ramCapacidad)} GB` : ''}</div>
+                            <div><strong>Almacenamiento:</strong> ${escaparHTML(equipo.almacenamientoTipo)}</div>
+                            ${detallesPc}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `);
+    });
+
+    lista.querySelectorAll('.eliminar-equipo').forEach((boton) => {
+        boton.addEventListener('click', () => eliminarEquipo(boton.dataset.equipoId));
+    });
+    lista.querySelectorAll('.editar-equipo').forEach((boton) => {
+        boton.addEventListener('click', () => editarEquipo(boton.dataset.equipoId));
+    });
+}
+
+async function cargarEquipos() {
+    const lista = document.getElementById('listaEquipos');
+    lista.innerHTML = '<p class="text-muted text-center mb-0">Cargando equipos...</p>';
+    document.getElementById('sinEquipos').classList.add('d-none');
+
+    try {
+        const respuesta = await fetch('/api/auth/equipos', { credentials: 'include' });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudieron cargar los equipos');
+        equiposUsuario = data.equipos || [];
+        mostrarEquipos(data.equipos);
+    } catch (error) {
+        equiposUsuario = [];
+        lista.innerHTML = `<p class="text-danger text-center mb-0">${escaparHTML(error.message)}</p>`;
+    }
+}
+
+async function eliminarEquipo(equipoId) {
+    if (!window.confirm('¿Quieres eliminar este equipo de tu cuenta?')) return;
+
+    try {
+        const respuesta = await fetch(`/api/auth/equipos/${encodeURIComponent(equipoId)}`, {
+            method: 'DELETE',
+            credentials: 'include'
+        });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo eliminar el equipo');
+        cargarEquipos();
+    } catch (error) {
+        document.getElementById('listaEquipos').insertAdjacentHTML(
+            'beforeend',
+            `<p class="text-danger small text-center mt-2">${escaparHTML(error.message)}</p>`
+        );
+    }
+}
+
+function abrirModalNuevoEquipo() {
+    document.getElementById('formEquipo').removeAttribute('data-equipo-id');
+    document.querySelector('#modalNuevoEquipo .modal-title').innerHTML = '<i class="bi bi-plus-circle me-2"></i>Agregar equipo';
+    document.querySelector('#formEquipo button[type="submit"]').innerHTML = '<i class="bi bi-save me-2"></i>Guardar y agregar equipo';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalNuevoEquipo')).show();
+}
+
+function editarEquipo(equipoId) {
+    const equipo = equiposUsuario.find((item) => String(item._id) === String(equipoId));
+    if (!equipo) return;
+
+    const valores = {
+        equipoNombre: equipo.nombre,
+        equipoTipo: equipo.tipo,
+        equipoMarca: equipo.marca,
+        equipoModelo: equipo.modelo,
+        equipoSistema: equipo.sistema || '',
+        equipoRamTipo: equipo.ramTipo,
+        equipoRamCapacidad: equipo.ramCapacidad || '',
+        equipoRamRanuras: equipo.ramRanuras || '',
+        equipoAlmacenamientoTipo: equipo.almacenamientoTipo,
+        equipoAlmacenamientoCapacidad: equipo.almacenamientoCapacidad || '',
+        equipoProcesador: equipo.procesador || '',
+        equipoSocket: equipo.socket || '',
+        equipoGrafica: equipo.tarjetaGrafica || '',
+        equipoFuente: equipo.fuentePotencia || ''
+    };
+    Object.entries(valores).forEach(([id, value]) => {
+        document.getElementById(id).value = value;
+    });
+    document.getElementById('formEquipo').dataset.equipoId = equipoId;
+    document.querySelector('#modalNuevoEquipo .modal-title').innerHTML = '<i class="bi bi-pencil me-2"></i>Editar equipo';
+    document.querySelector('#formEquipo button[type="submit"]').innerHTML = '<i class="bi bi-save me-2"></i>Guardar cambios';
+    document.getElementById('camposPc').classList.toggle('d-none', equipo.tipo !== 'PC');
+    document.getElementById('notaLaptop').classList.toggle('d-none', equipo.tipo !== 'Laptop');
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalEquipos')).hide();
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalNuevoEquipo')).show();
+}
+
+document.getElementById('misEquipos').addEventListener('click', () => {
+    if (!sesionUsuario) {
+        solicitarInicioSesion('Primero inicia sesión para administrar tus equipos.');
+        return;
+    }
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalEquipos')).show();
+    cargarEquipos();
+});
+
+document.getElementById('misCompras').addEventListener('click', () => {
+    if (!sesionUsuario) {
+        solicitarInicioSesion('Primero inicia sesión para consultar tus compras.');
+        return;
+    }
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCompras')).show();
+    cargarCompras();
+});
+
+document.getElementById('agregarEquipo').addEventListener('click', () => {
+    if (!sesionUsuario) {
+        solicitarInicioSesion('Primero inicia sesión para registrar un equipo.');
+        return;
+    }
+    abrirModalNuevoEquipo();
+});
+document.getElementById('nuevoEquipoDesdeLista').addEventListener('click', () => {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalEquipos')).hide();
+    abrirModalNuevoEquipo();
+});
+
+document.getElementById('equipoTipo').addEventListener('change', (event) => {
+    const esPc = event.target.value === 'PC';
+    document.getElementById('camposPc').classList.toggle('d-none', !esPc);
+    document.getElementById('notaLaptop').classList.toggle('d-none', esPc || !event.target.value);
+});
+
+document.getElementById('formEquipo').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const tipo = document.getElementById('equipoTipo').value;
+    const equipoId = event.currentTarget.dataset.equipoId;
+    const mensaje = document.getElementById('msgEquipo');
+    const valor = (id) => document.getElementById(id).value.trim();
+    const numero = (id) => document.getElementById(id).value ? Number(document.getElementById(id).value) : undefined;
+    const datos = {
+        nombre: valor('equipoNombre'),
+        tipo,
+        marca: valor('equipoMarca'),
+        modelo: valor('equipoModelo'),
+        sistema: valor('equipoSistema'),
+        ramTipo: valor('equipoRamTipo'),
+        ramCapacidad: numero('equipoRamCapacidad'),
+        ramRanuras: numero('equipoRamRanuras'),
+        almacenamientoTipo: valor('equipoAlmacenamientoTipo'),
+        almacenamientoCapacidad: numero('equipoAlmacenamientoCapacidad')
+    };
+
+    if (tipo === 'PC') {
+        datos.procesador = valor('equipoProcesador');
+        datos.socket = valor('equipoSocket');
+        datos.tarjetaGrafica = valor('equipoGrafica');
+        datos.fuentePotencia = numero('equipoFuente');
+    }
+
+    mensaje.textContent = 'Guardando equipo...';
+    mensaje.className = 'small text-center text-info fw-medium mt-3';
+
+    try {
+        const respuesta = await fetch(equipoId
+            ? `/api/auth/equipos/${encodeURIComponent(equipoId)}`
+            : '/api/auth/equipos', {
+            method: equipoId ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(datos)
+        });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo guardar el equipo');
+
+        mensaje.textContent = data.message;
+        mensaje.className = 'small text-center text-success fw-medium mt-3';
+        document.getElementById('formEquipo').reset();
+        document.getElementById('formEquipo').removeAttribute('data-equipo-id');
+        document.getElementById('camposPc').classList.add('d-none');
+        document.getElementById('notaLaptop').classList.add('d-none');
+        document.querySelector('#modalNuevoEquipo .modal-title').innerHTML = '<i class="bi bi-plus-circle me-2"></i>Agregar equipo';
+        document.querySelector('#formEquipo button[type="submit"]').innerHTML = '<i class="bi bi-save me-2"></i>Guardar y agregar equipo';
+        cargarEquipos();
+        setTimeout(() => {
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('modalNuevoEquipo')).hide();
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('modalEquipos')).show();
+        }, 500);
+    } catch (error) {
+        mensaje.textContent = error.message;
+        mensaje.className = 'small text-center text-danger fw-medium mt-3';
+    }
+});
+
+function llenarEquiposEnSelector() {
+    const selector = document.getElementById('equipoCompatibilidad');
+    selector.innerHTML = '<option value="">Selecciona un equipo</option>';
+    equiposUsuario.forEach((equipo) => {
+        selector.insertAdjacentHTML(
+            'beforeend',
+            `<option value="${escaparHTML(equipo._id)}">${escaparHTML(equipo.nombre)} (${escaparHTML(equipo.tipo)} - ${escaparHTML(equipo.ramTipo)} / ${escaparHTML(equipo.almacenamientoTipo)})</option>`
+        );
+    });
+}
+
+function mostrarResultadoCompatibilidad(resultado) {
+    const contenedor = document.getElementById('resultadoCompatibilidad');
+    const clases = {
+        compatible: 'alert alert-success small mb-3',
+        'no-compatible': 'alert alert-danger small mb-3',
+        incompleta: 'alert alert-warning small mb-3'
+    };
+    contenedor.className = clases[resultado.estado] || 'alert alert-light small mb-3';
+    contenedor.textContent = resultado.mensaje;
+    document.getElementById('btnAgregarCarrito').disabled = resultado.estado !== 'compatible';
+}
+
+async function abrirModalCompatibilidad(productoId) {
+    if (!sesionUsuario) {
+        solicitarInicioSesion('Inicia sesión para validar compatibilidad y agregar al carrito.');
+        return;
+    }
+
+    if (!equiposUsuario.length) {
+        await cargarEquipos();
+    }
+    if (!equiposUsuario.length) {
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('modalEquipos')).show();
+        document.getElementById('listaEquipos').insertAdjacentHTML(
+            'beforeend',
+            '<p class="text-warning text-center small mt-3">Registra al menos un equipo para validar compatibilidad.</p>'
+        );
+        return;
+    }
+
+    productoCompatibilidadActual = productosCatalogo.find((producto) => String(producto._id) === productoId) || null;
+    resultadoCompatibilidadActual = null;
+    if (!productoCompatibilidadActual) return;
+
+    document.getElementById('productoCompatibilidadNombre').textContent = productoCompatibilidadActual.nombre;
+    document.getElementById('productoCompatibilidadPrecio').textContent = `$${Number(productoCompatibilidadActual.precio || 0).toLocaleString()} MXN`;
+    document.getElementById('compatibilidadReglas').innerHTML = badgeCompatibilidad(productoCompatibilidadActual.compatibilidad || {});
+    document.getElementById('msgCompatibilidad').textContent = '';
+    document.getElementById('equipoCompatibilidad').value = '';
+    document.getElementById('btnAgregarCarrito').disabled = true;
+    document.getElementById('resultadoCompatibilidad').className = 'alert alert-light small mb-3';
+    document.getElementById('resultadoCompatibilidad').textContent = 'Selecciona un equipo para validar compatibilidad.';
+    llenarEquiposEnSelector();
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCompatibilidad')).show();
+}
+
+function evaluarCompatibilidadSeleccionada() {
+    const equipoId = document.getElementById('equipoCompatibilidad').value;
+    if (!equipoId || !productoCompatibilidadActual) {
+        document.getElementById('btnAgregarCarrito').disabled = true;
+        return;
+    }
+
+    const equipo = equiposUsuario.find((item) => String(item._id) === equipoId);
+    if (!equipo) return;
+    resultadoCompatibilidadActual = {
+        ...validarCompatibilidad(productoCompatibilidadActual, equipo),
+        equipoId: String(equipo._id),
+        equipoNombre: equipo.nombre
+    };
+    mostrarResultadoCompatibilidad(resultadoCompatibilidadActual);
+}
+
+document.getElementById('equipoCompatibilidad').addEventListener('change', evaluarCompatibilidadSeleccionada);
+
+document.getElementById('btnAgregarCarrito').addEventListener('click', () => {
+    if (!productoCompatibilidadActual || !resultadoCompatibilidadActual || resultadoCompatibilidadActual.estado !== 'compatible') {
+        return;
+    }
+
+    const existente = carrito.find((item) =>
+        item.productoId === String(productoCompatibilidadActual._id)
+        && item.equipoId === resultadoCompatibilidadActual.equipoId
+    );
+    const cantidadEnCarrito = carrito
+        .filter((item) => item.productoId === String(productoCompatibilidadActual._id))
+        .reduce((total, item) => total + item.cantidad, 0);
+    const stockDisponible = Number(productoCompatibilidadActual.stock);
+
+    if (!Number.isInteger(stockDisponible) || cantidadEnCarrito >= stockDisponible) {
+        const mensaje = document.getElementById('msgCompatibilidad');
+        mensaje.textContent = 'No hay más unidades disponibles de este producto.';
+        mensaje.className = 'small fw-medium text-danger';
+        return;
+    }
+
+    if (existente) {
+        existente.cantidad += 1;
+    } else {
+        carrito.push({
+            productoId: String(productoCompatibilidadActual._id),
+            nombre: productoCompatibilidadActual.nombre,
+            precio: Number(productoCompatibilidadActual.precio || 0),
+            cantidad: 1,
+            equipoId: resultadoCompatibilidadActual.equipoId,
+            equipoNombre: resultadoCompatibilidadActual.equipoNombre,
+            detalleCompatibilidad: resultadoCompatibilidadActual.mensaje
+        });
+    }
+
+    guardarCarrito();
+    actualizarIndicadorCarrito();
+    renderizarCarrito();
+    const mensaje = document.getElementById('msgCompatibilidad');
+    mensaje.textContent = 'Producto agregado al carrito.';
+    mensaje.className = 'small fw-medium text-success';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCompatibilidad')).hide();
+});
+
+async function cargarSesion() {
+    try {
+        const respuesta = await fetch('/api/auth/me', { credentials: 'include' });
+        if (respuesta.ok) {
+            const data = await respuesta.json();
+            mostrarUsuario(data.user);
+        } else {
+            mostrarCuentaInicial();
+        }
+    } catch (error) {
+        console.error('No se pudo comprobar la sesión:', error);
+        mostrarCuentaInicial();
+    }
+}
+
+document.getElementById('cerrarSesion').addEventListener('click', async () => {
+    await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include'
+    });
+    mostrarCuentaInicial();
+});
+
+// 1. Cargar productos desde MongoDB
+async function cargarProductos(categoria = '') {
+    try {
+        const url = new URL('/api/productos', window.location.origin);
+        if (categoria) {
+            url.searchParams.set('categoria', categoria);
+        }
+
+        const respuesta = await fetch(url);
+        const productos = await respuesta.json();
+        productosCatalogo = [
+            ...productosCatalogo.filter((productoAnterior) =>
+                !productos.some((producto) => String(producto._id) === String(productoAnterior._id))
+            ),
+            ...productos
+        ];
+        
+        const contenedor = document.getElementById('contenedor-productos');
+        contenedor.innerHTML = ''; 
+
+        if (productos.length === 0) {
+            contenedor.innerHTML = '<p class="text-center text-muted col-12">No hay productos en esta categoría.</p>';
+            return;
+        }
+
+        productos.forEach((producto) => {
+            const compatibilidad = producto.compatibilidad || {};
+            const cardHTML = `
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm rounded-4 text-center p-3">
+                        <div class="text-end mb-2">
+                            <span class="badge bg-success"><i class="bi bi-shield-check"></i> 0 Riesgo</span>
+                        </div>
+                        <div class="bg-secondary bg-opacity-10 rounded-3 p-4 mb-3 d-flex align-items-center justify-content-center" style="height: 180px;">
+                            <i class="bi bi-pc-display-horizontal display-1 text-dark"></i>
+                        </div>
+                        <div class="card-body p-0 d-flex flex-column">
+                            <h5 class="card-title fw-bold">${escaparHTML(producto.nombre)}</h5>
+                            <p class="card-text text-muted small">${escaparHTML(producto.descripcion_corta || 'Sin descripción')}</p>
+                            <div class="product-rating mb-2">
+                                ${estrellasHTML(producto.resenas?.promedio || 0)}
+                                <button type="button" class="btn btn-link btn-sm p-0 ms-2 btn-ver-resenas" data-producto-id="${escaparHTML(String(producto._id))}" data-producto-nombre="${escaparHTML(producto.nombre)}">
+                                    ${Number(producto.resenas?.total || 0)} ${Number(producto.resenas?.total || 0) === 1 ? 'reseña' : 'reseñas'}
+                                </button>
+                            </div>
+                            <p class="text-primary small mb-3"><i class="bi bi-tools"></i> Incluye manual y herramientas</p>
+                            <div class="mb-2">${badgeCompatibilidad(compatibilidad, producto)}</div>
+                            <p class="fw-bold fs-5 mt-auto">$${Number(producto.precio || 0).toLocaleString()} MXN</p>
+                            <p class="small ${Number(producto.stock) > 0 ? 'text-muted' : 'text-danger'} mb-2">
+                                ${Number(producto.stock) > 0 ? `Disponibles: ${Number(producto.stock)}` : 'Agotado'}
+                            </p>
+                            <button class="btn btn-dark rounded-pill w-100 mt-2 btn-validar-compatibilidad" data-producto-id="${escaparHTML(String(producto._id))}" ${Number(producto.stock) > 0 ? '' : 'disabled'}>${Number(producto.stock) > 0 ? 'Validar Compatibilidad' : 'Agotado'}</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            contenedor.innerHTML += cardHTML;
+        });
+
+        contenedor.querySelectorAll('.btn-validar-compatibilidad').forEach((boton) => {
+            boton.addEventListener('click', () => abrirModalCompatibilidad(boton.dataset.productoId));
+        });
+        contenedor.querySelectorAll('.btn-ver-resenas').forEach((boton) => {
+            boton.addEventListener('click', () => abrirResenas(boton.dataset.productoId, boton.dataset.productoNombre));
+        });
+    } catch (error) {
+        console.error("Error al conectar con el backend de productos:", error);
+    }
+
+}
+
+document.querySelectorAll('.review-star').forEach((boton) => {
+    boton.addEventListener('click', () => {
+        estrellasResenaSeleccionadas = Number(boton.dataset.estrellas);
+        actualizarEstrellasResena();
+    });
+});
+
+document.getElementById('btnPublicarResena').addEventListener('click', async () => {
+    const mensaje = document.getElementById('msgResena');
+    const comentario = document.getElementById('comentarioResena').value.trim();
+    if (!estrellasResenaSeleccionadas || !comentario) {
+        mensaje.textContent = 'Selecciona una calificación y escribe un comentario.';
+        mensaje.className = 'small fw-medium mt-2 text-danger';
+        return;
+    }
+
+    const boton = document.getElementById('btnPublicarResena');
+    boton.disabled = true;
+    mensaje.textContent = 'Publicando reseña...';
+    mensaje.className = 'small fw-medium mt-2 text-info';
+    try {
+        const respuesta = await fetch(`/api/productos/${encodeURIComponent(productoResenasActual)}/resenas`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ estrellas: estrellasResenaSeleccionadas, comentario })
+        });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo publicar la reseña');
+        mensaje.textContent = data.message;
+        mensaje.className = 'small fw-medium mt-2 text-success';
+        document.getElementById('formularioResena').classList.add('d-none');
+        const categoria = document.querySelector('.filtro-categoria.active')?.dataset.categoria || '';
+        await cargarProductos(categoria);
+        setTimeout(() => abrirResenas(productoResenasActual, document.getElementById('tituloResenas').textContent, false), 500);
+    } catch (error) {
+        mensaje.textContent = error.message;
+        mensaje.className = 'small fw-medium mt-2 text-danger';
+    } finally {
+        boton.disabled = false;
+    }
+});
+
+document.querySelectorAll('.filtro-categoria').forEach((boton) => {
+    boton.addEventListener('click', () => {
+        document.querySelectorAll('.filtro-categoria').forEach((item) => item.classList.remove('active'));
+        boton.classList.add('active');
+        cargarProductos(boton.dataset.categoria);
+    });
+});
+
+document.getElementById('btnVaciarCarrito').addEventListener('click', () => {
+    if (!carrito.length) return;
+    carrito = [];
+    guardarCarrito();
+    actualizarIndicadorCarrito();
+    renderizarCarrito();
+});
+
+document.getElementById('btnCheckout').addEventListener('click', async () => {
+    const carritoValido = await validarCarritoFinal();
+    if (!carritoValido) return;
+    await cargarDirecciones();
+    prepararCheckout();
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCarrito')).hide();
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCheckout')).show();
+});
+
+document.getElementById('direccionGuardada').addEventListener('change', (event) => {
+    const direccion = direccionesUsuario.find((item) => String(item._id) === event.target.value);
+    if (direccion) llenarDatosDireccion(direccion);
+    else document.getElementById('formCheckout').reset();
+});
+
+document.getElementById('btnAbrirTerminos').addEventListener('click', () => {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalTerminos')).show();
+});
+
+document.getElementById('aceptaTerminos').addEventListener('change', validarAceptacionTerminos);
+
+function validarAceptacionTerminos() {
+    const checkbox = document.getElementById('aceptaTerminos');
+    const mensaje = document.getElementById('msgTerminos');
+    if (checkbox.checked) {
+        mensaje.classList.add('d-none');
+        return true;
+    }
+    mensaje.classList.remove('d-none');
+    checkbox.focus();
+    return false;
+}
+
+function generarCodigoPaynet(total) {
+    const codigo = `PAYNET-${Date.now().toString().slice(-10)}-${Math.round(total).toString().padStart(6, '0')}`;
+    const visual = document.getElementById('paynetBarcodeVisual');
+    document.getElementById('paynetBarcodeContainer').classList.remove('d-none');
+    document.getElementById('paynetBarcodeValue').textContent = codigo;
+    visual.replaceChildren();
+
+    if (typeof QRCode !== 'function') {
+        throw new Error('No se pudo cargar el generador del código QR. Recarga la página e inténtalo de nuevo.');
+    }
+
+    new QRCode(visual, {
+        text: codigo,
+        width: 160,
+        height: 160,
+        colorDark: '#1d1d1f',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M
+    });
+}
+
+function textoPDF(valor) {
+    return String(valor ?? '').replace(/[^\x20-\x7E\xA0-\xFF]/g, '');
+}
+
+function monedaPDF(valor) {
+    return `$${Number(valor || 0).toLocaleString('es-MX', { minimumFractionDigits: 2 })} MXN`;
+}
+
+function dibujarLineaPDF(doc, y, margen, ancho) {
+    doc.setDrawColor(224, 230, 238);
+    doc.line(margen, y, ancho - margen, y);
+}
+
+function generarComprobantePDF(compra) {
+    if (!window.jspdf?.jsPDF || !compra) {
+        throw new Error('No fue posible preparar el comprobante PDF');
+    }
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+        const margen = 18;
+        const ancho = 210;
+        const contenido = ancho - (margen * 2);
+        const azul = [23, 105, 224];
+        const oscuro = [29, 41, 57];
+        let y = 18;
+
+        doc.setFillColor(...azul);
+        doc.rect(0, 0, ancho, 42, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(22);
+        doc.text('TechStore', margen, 22);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(10);
+        doc.text('Comprobante de compra', margen, 30);
+        doc.setFontSize(9);
+        doc.text(`Folio: ${textoPDF(compra.orderId)}`, ancho - margen, 21, { align: 'right' });
+        doc.text(`Fecha: ${textoPDF(compra.fecha)}`, ancho - margen, 28, { align: 'right' });
+
+        y = 55;
+        doc.setTextColor(...oscuro);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(13);
+        doc.text('Gracias por tu compra', margen, y);
+        y += 8;
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.setTextColor(91, 105, 124);
+        doc.text('Este documento es un resumen informativo de tu pedido y no es una factura fiscal.', margen, y);
+        y += 12;
+
+        doc.setFillColor(247, 249, 252);
+        doc.roundedRect(margen, y, contenido, 31, 3, 3, 'F');
+        doc.setTextColor(...oscuro);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(10);
+        doc.text('Datos del cliente', margen + 6, y + 8);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.text(`Nombre: ${textoPDF(compra.envio.nombre)}`, margen + 6, y + 15);
+        doc.text(`Correo: ${textoPDF(sesionUsuario?.email || 'Registrado en TechStore')}`, margen + 6, y + 22);
+        doc.text(`Teléfono: ${textoPDF(compra.envio.telefono)}`, 112, y + 15);
+        doc.text(`Método de pago: ${textoPDF(compra.metodoPago)}`, 112, y + 22);
+        y += 40;
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(10);
+        doc.setTextColor(...oscuro);
+        doc.text('Dirección de envío', margen, y);
+        y += 6;
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        const direccion = `${compra.envio.direccion}, ${compra.envio.ciudad}, ${compra.envio.estado}, C.P. ${compra.envio.codigoPostal}`;
+        const direccionLineas = doc.splitTextToSize(textoPDF(direccion), contenido);
+        doc.text(direccionLineas, margen, y);
+        y += direccionLineas.length * 5 + 8;
+        dibujarLineaPDF(doc, y, margen, ancho);
+        y += 9;
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(10);
+        doc.text(`Productos (${compra.cantidadTotal})`, margen, y);
+        y += 8;
+        doc.setFontSize(8);
+        doc.setTextColor(91, 105, 124);
+        doc.text('PRODUCTO', margen, y);
+        doc.text('CANT.', 130, y, { align: 'right' });
+        doc.text('PRECIO', 158, y, { align: 'right' });
+        doc.text('SUBTOTAL', ancho - margen, y, { align: 'right' });
+        y += 5;
+        dibujarLineaPDF(doc, y, margen, ancho);
+        y += 7;
+
+        doc.setTextColor(...oscuro);
+        doc.setFontSize(9);
+        compra.items.forEach((item) => {
+            const detalle = `${textoPDF(item.nombre)}\nEquipo: ${textoPDF(item.equipoNombre)}\nCompatibilidad: ${textoPDF(item.compatibilidad)}`;
+            const nombre = doc.splitTextToSize(detalle, 90);
+            const alto = Math.max(7, nombre.length * 4.5);
+            if (y + alto > 270) {
+                doc.addPage();
+                y = 20;
+            }
+            doc.text(nombre, margen, y);
+            doc.text(String(item.cantidad), 130, y, { align: 'right' });
+            doc.text(monedaPDF(item.precioUnitario), 158, y, { align: 'right' });
+            doc.text(monedaPDF(item.subtotal), ancho - margen, y, { align: 'right' });
+            y += alto + 4;
+        });
+
+        dibujarLineaPDF(doc, y, margen, ancho);
+        y += 9;
+        doc.setFont('helvetica', 'normal');
+        doc.text('Total de productos', 125, y, { align: 'right' });
+        doc.text(String(compra.cantidadTotal), ancho - margen, y, { align: 'right' });
+        y += 7;
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(14);
+        doc.setTextColor(...azul);
+        doc.text('TOTAL PAGADO', 145, y, { align: 'right' });
+        doc.text(monedaPDF(compra.total), ancho - margen, y, { align: 'right' });
+        y += 18;
+
+        doc.setFillColor(239, 247, 255);
+        doc.roundedRect(margen, y, contenido, 19, 3, 3, 'F');
+        doc.setTextColor(...azul);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9);
+        doc.text('Información de tu pedido', margen + 6, y + 7);
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(...oscuro);
+        doc.text('Conserva este comprobante para consultar el resumen de tu compra.', margen + 6, y + 13);
+        doc.text('Gracias por elegir TechStore.', margen + 6, y + 17);
+
+        doc.setTextColor(130, 144, 165);
+        doc.setFontSize(8);
+        doc.text('TechStore · Repuestos y componentes compatibles', ancho / 2, 287, { align: 'center' });
+    doc.save(`comprobante-TechStore-${textoPDF(compra.orderId).slice(-8)}.pdf`);
+}
+
+function obtenerDatosEnvio() {
+    const valor = (id) => document.getElementById(id).value.trim();
+    return {
+        nombre: valor('envioNombre'),
+        telefono: valor('envioTelefono'),
+        direccion: valor('envioDireccion'),
+        ciudad: valor('envioCiudad'),
+        estado: valor('envioEstado'),
+        codigoPostal: valor('envioCodigoPostal')
+    };
+}
+
+async function confirmarCompraSimulada(metodoPago, idBoton) {
+    if (!carrito.length) {
+        const mensajeCarritoVacio = document.getElementById('msgCheckout');
+        mensajeCarritoVacio.textContent = 'La compra ya fue procesada. Puedes descargar tu comprobante o cerrar esta ventana.';
+        mensajeCarritoVacio.className = 'small text-center fw-medium mt-3 text-info';
+        return;
+    }
+
+    const datosEnvio = obtenerDatosEnvio();
+    if (Object.values(datosEnvio).some((valor) => !valor)) {
+        const mensajeDatosIncompletos = document.getElementById('msgCheckout');
+        mensajeDatosIncompletos.textContent = 'Completa los datos de envío antes de continuar con el pago.';
+        mensajeDatosIncompletos.className = 'small text-center fw-medium mt-3 text-danger';
+        return;
+    }
+
+    const boton = document.getElementById(idBoton);
+    const mensaje = document.getElementById('msgCheckout');
+    boton.disabled = true;
+    mensaje.textContent = `Validando pago con ${metodoPago}...`;
+    mensaje.className = 'small text-center fw-medium mt-3 text-info';
+
+    try {
+        const respuesta = await fetch('/api/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                items: carrito,
+                envio: datosEnvio,
+                metodoPago
+            })
+        });
+        const data = await respuesta.json();
+        if (!respuesta.ok) throw new Error(data.message || 'No se pudo simular el pago');
+
+        const envio = datosEnvio;
+        const itemsCompra = carrito.map((item) => ({
+            nombre: item.nombre,
+            equipoNombre: item.equipoNombre,
+            compatibilidad: item.compatibilidad,
+            cantidad: item.cantidad,
+            precioUnitario: item.precio,
+            subtotal: item.precio * item.cantidad
+        }));
+        ultimaCompraComprobante = {
+            orderId: data.orderId,
+            fecha: new Date().toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' }),
+            envio,
+            items: itemsCompra,
+            cantidadTotal: itemsCompra.reduce((total, item) => total + item.cantidad, 0),
+            total: data.total,
+            metodoPago
+        };
+        mensaje.innerHTML = `${escaparHTML(data.message)}. Folio: ${escaparHTML(data.orderId)} <button id="btnDescargarComprobante" type="button" class="btn btn-sm btn-outline-primary rounded-pill ms-2"><i class="bi bi-file-earmark-pdf me-1"></i>Descargar comprobante PDF</button>`;
+        mensaje.className = 'small text-center fw-medium mt-3 text-success';
+        document.getElementById('btnDescargarComprobante').addEventListener('click', () => {
+            try {
+                generarComprobantePDF(ultimaCompraComprobante);
+            } catch (error) {
+                mensaje.textContent = error.message;
+                mensaje.className = 'small text-center fw-medium mt-3 text-danger';
+            }
+        });
+        if (metodoPago === 'Paynet') generarCodigoPaynet(data.total);
+        else limpiarCodigoPaynet();
+        document.getElementById('metodoPago').value = 'Paynet';
+        compraConfirmadaCheckout = true;
+        ['btnPagarPaynet', 'btnPagarTarjeta', 'btnPagarPayPal', 'btnConfirmarPago']
+            .forEach((id) => { document.getElementById(id).disabled = true; });
+    } catch (error) {
+        mensaje.textContent = error.message;
+        mensaje.className = 'small text-center fw-medium mt-3 text-danger';
+    } finally {
+        if (!compraConfirmadaCheckout && carrito.length) boton.disabled = false;
+    }
+}
+
+function seleccionarMetodoPago(metodoPago, idBoton) {
+    document.getElementById('metodoPago').value = metodoPago;
+    document.querySelectorAll('.payment-option').forEach((boton) => {
+        const seleccionado = boton.id === idBoton;
+        boton.classList.toggle('selected', seleccionado);
+        boton.setAttribute('aria-pressed', String(seleccionado));
+    });
+}
+
+document.getElementById('btnPagarPaynet').addEventListener('click', () => {
+    seleccionarMetodoPago('Paynet', 'btnPagarPaynet');
+    const total = carrito.reduce((suma, item) => suma + (item.precio * item.cantidad), 0);
+    generarCodigoPaynet(total);
+});
+
+document.getElementById('btnPagarTarjeta').addEventListener('click', () => {
+    seleccionarMetodoPago('Tarjeta', 'btnPagarTarjeta');
+    limpiarCodigoPaynet();
+});
+
+document.getElementById('btnPagarPayPal').addEventListener('click', () => {
+    seleccionarMetodoPago('PayPal', 'btnPagarPayPal');
+    limpiarCodigoPaynet();
+});
+
+document.getElementById('btnConfirmarPago').addEventListener('click', async () => {
+    const metodoPago = document.getElementById('metodoPago').value || 'Paynet';
+    const botonesPorMetodo = {
+        Paynet: 'btnPagarPaynet',
+        Tarjeta: 'btnPagarTarjeta',
+        PayPal: 'btnPagarPayPal'
+    };
+    const idBoton = botonesPorMetodo[metodoPago] || botonesPorMetodo.Paynet;
+    seleccionarMetodoPago(metodoPago, idBoton);
+    if (metodoPago === 'Paynet') {
+        const total = carrito.reduce((suma, item) => suma + (item.precio * item.cantidad), 0);
+        generarCodigoPaynet(total);
+    } else {
+        limpiarCodigoPaynet();
+    }
+    if (!validarAceptacionTerminos()) return;
+    if (!document.getElementById('formCheckout').reportValidity()) return;
+    await confirmarCompraSimulada(metodoPago, idBoton);
+});
+
+document.getElementById('modalCheckout').addEventListener('hidden.bs.modal', () => {
+    if (!compraConfirmadaCheckout) return;
+    carrito = [];
+    guardarCarrito();
+    actualizarIndicadorCarrito();
+    renderizarCarrito();
+    compraConfirmadaCheckout = false;
+});
+
+
+document.getElementById('modalCarrito').addEventListener('show.bs.modal', () => {
+    if (!sesionUsuario) {
+        solicitarInicioSesion('Inicia sesión para usar tu carrito personalizado.');
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCarrito')).hide();
+        return;
+    }
+    renderizarCarrito();
+});
+
+// 2. Manejo del Registro de Usuarios
+document.getElementById('formRegistro').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = document.getElementById('regName').value;
+    const email = document.getElementById('regEmail').value;
+    const password = document.getElementById('regPassword').value;
+    const msgDiv = document.getElementById('msgRegistro');
+
+    msgDiv.textContent = "Creando tu cuenta...";
+    msgDiv.className = "mt-3 small text-center text-info fw-medium";
+
+    try {
+        const res = await fetch('/api/auth/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, email, password })
+        });
+        const data = await res.json();
+        msgDiv.textContent = data.message;
+        msgDiv.className = res.ok ? "mt-3 small text-center text-success fw-medium" : "mt-3 small text-center text-danger fw-medium";
+        if (res.ok) {
+            document.getElementById('formRegistro').reset();
+        }
+    } catch (error) {
+        msgDiv.textContent = "Error de conexión con el servidor";
+        msgDiv.className = "mt-3 small text-center text-danger fw-medium";
+    }
+});
+
+// 3. Manejo del Inicio de Sesión
+document.getElementById('formLogin').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = document.getElementById('loginEmail').value;
+    const password = document.getElementById('loginPassword').value;
+    const msgDiv = document.getElementById('msgLogin');
+
+    msgDiv.textContent = "Verificando credenciales...";
+    msgDiv.className = "mt-3 small text-center text-info fw-medium";
+
+    try {
+        const res = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+        msgDiv.textContent = data.message;
+        msgDiv.className = res.ok ? "mt-3 small text-center text-success fw-medium" : "mt-3 small text-center text-danger fw-medium";
+        if (res.ok) {
+            document.getElementById('formLogin').reset();
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('modalAuth')).hide();
+            mostrarUsuario(data.user);
+        }
+    } catch (error) {
+        msgDiv.textContent = "Error de conexión con el servidor";
+        msgDiv.className = "mt-3 small text-center text-danger fw-medium";
+    }
+});
+
+// 4. Manejo del Formulario de Contacto
+document.getElementById('formContacto').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const nombre = document.getElementById('contNombre').value;
+    const emailUsuario = document.getElementById('contEmail').value;
+    const mensaje = document.getElementById('contMensaje').value;
+    const msgDiv = document.getElementById('msgContacto');
+
+    msgDiv.textContent = "Enviando mensaje...";
+    msgDiv.className = "mt-3 small text-center text-info fw-medium";
+
+    try {
+        await emailjs.send(EMAILJS_CONFIG.serviceId, EMAILJS_CONFIG.templateId, {
+            from_name: nombre,
+            reply_to: emailUsuario,
+            message: mensaje
+        });
+        msgDiv.textContent = "Mensaje enviado correctamente";
+        msgDiv.className = "mt-3 small text-center text-success fw-medium";
+        document.getElementById('formContacto').reset();
+    } catch (error) {
+        msgDiv.textContent = "Error al enviar el mensaje";
+        msgDiv.className = "mt-3 small text-center text-danger fw-medium";
+    }
+});
+
+document.querySelectorAll('[aria-label="Mostrar contraseña"]').forEach((button) => {
+    button.addEventListener('click', () => {
+        const passwordInput = button.closest('.input-group')?.querySelector('input[type="password"], input[type="text"]');
+        if (!passwordInput) return;
+        const icon = button.querySelector('i');
+        const isHidden = passwordInput.type === 'password';
+
+        passwordInput.type = isHidden ? 'text' : 'password';
+        icon.className = isHidden ? 'bi bi-eye-slash' : 'bi bi-eye';
+        button.setAttribute('aria-label', isHidden ? 'Ocultar contraseña' : 'Mostrar contraseña');
+    });
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+    cargarProductos();
+    cargarSesion();
+});
